@@ -8,7 +8,7 @@ const compact = (value: string, max: number) => value.replace(/\s+/g, ' ').trim(
 
 /** Automatic RP recall is restricted to the active Character's own communication graph.
  * The caller supplies swipe-projected state so rejected candidates cannot become memory. */
-export function roleplayPhoneRecall(state: PhoneState, maxChars = 3_200): string {
+export function roleplayPhoneRecall(state: PhoneState, maxChars = 3_200, omitTimes = false): string {
   if (!state.characterId || state.characterId === '_none') return ''
   const contacts = state.contacts.filter(contact => contact.source.kind === 'character' && contact.source.characterId === state.characterId)
   const ids = new Set([state.characterId, `card:${state.characterId}`, ...contacts.map(contact => contact.id)])
@@ -30,7 +30,7 @@ export function roleplayPhoneRecall(state: PhoneState, maxChars = 3_200): string
         : conversation.kind === 'direct')
       if (!canKnow || !message.text.trim()) continue
       rows.push({ id: message.id, at: message.createdAt, channel, speaker: message.senderName || nameFor(sender),
-        text: message.text, stamp: messageHistoryContextLabel(state, message, conversation) })
+        text: message.text, stamp: omitTimes ? undefined : messageHistoryContextLabel(state, message, conversation) })
     }
   }
   for (const thread of state.social?.dmThreads || []) {

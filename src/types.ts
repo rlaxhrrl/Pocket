@@ -1054,6 +1054,10 @@ export interface PhoneState {
   roleplayClockSource?: 'manual' | 'narrative' | 'legacy'
   roleplayClockPrecision?: 'exact' | 'approximate' | 'relative' | 'unknown'
   roleplayClockLabel?: string
+  /** When true, the Pocket clock flows with the real wall clock (plus roleplayRealtimeOffsetMs) instead of staying fixed. */
+  roleplayClockRealtime?: boolean
+  /** Milliseconds added to the wall clock while roleplayClockRealtime is on. 0 = the real current time. */
+  roleplayRealtimeOffsetMs?: number
   /** Browser getTimezoneOffset(), persisted so backend can interpret narrative local times. */
   roleplayTimezoneOffsetMinutes?: number
   /** Monotonic Pocket-state revision advanced by post-turn reconciliation. */

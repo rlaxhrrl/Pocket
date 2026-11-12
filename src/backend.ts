@@ -117,6 +117,7 @@ import { normalizeContactGroups, saveContactGroup } from './domain/contact-group
 import { createCaptureReference, createPocketReference, latestArmedReference, referenceForGeneration, serializePocketReference } from './backend/references.js'
 
 import {timeskipMinutes,timeskipLabel} from './domain/timeskip.js'
+import {realtimeOffset,syncRealtimeClock} from './domain/realtime-clock.js'
 import {normalizeChatAppearance} from './domain/chat-appearance.js'
 import { fullProfile, profileContext } from './backend/context-options.js'
 import type { PocketLoreRetrievalLog } from './types.js'
@@ -817,6 +818,8 @@ function normalizeState(value: unknown, chatId: string, characterId: string, cha
     roleplayClockPrecision: value.roleplayClockPrecision === 'exact' || value.roleplayClockPrecision === 'approximate' || value.roleplayClockPrecision === 'relative' ? value.roleplayClockPrecision : 'unknown',
     roleplayClockLabel: value.roleplayClockPrecision === 'exact' || value.roleplayClockSource === 'manual' ? text(value.roleplayClockLabel, 160) : clockLabel(value.roleplayClockLabel),
     roleplayTimezoneOffsetMinutes: Number.isFinite(Number(value.roleplayTimezoneOffsetMinutes)) ? Number(value.roleplayTimezoneOffsetMinutes) : undefined,
+    roleplayClockRealtime: value.roleplayClockRealtime === true ? true : undefined,
+    roleplayRealtimeOffsetMs: value.roleplayClockRealtime === true ? realtimeOffset(value.roleplayRealtimeOffsetMs) : undefined,
     stateRevision: Math.max(0, Math.round(numberValue(value.stateRevision, 0))),
     hostSwipeSelections,
     hostClockBaselines,
@@ -1027,6 +1030,8 @@ async function loadState(chatId: string, characterId: string, userId?: string): 
   })
   if (isRecord(raw) && Number(raw.version) > STATE_VERSION) throw new Error('This phone state was created by a newer Pocket version.')
   const state = normalizeState(raw, chatId, characterId, characterName)
+  // Real-time clock: every load reads the live wall-clock time, so the Pocket clock keeps flowing.
+  syncRealtimeClock(state)
   await loadPreferences(userId, isRecord(raw) ? raw.settings : undefined)
   let stateChanged = Boolean(isRecord(raw) && Number(raw.version || 0) <= STATE_VERSION && (raw.settings !== undefined || Number(raw.version || 0) < STATE_VERSION))
   if (state.actorMemoryVersion < 1) {
@@ -1315,6 +1320,7 @@ function roleplayClockSnapshot(state: PhoneState): PocketRoleplayClockSnapshot {
 }
 
 function applyRoleplayClockSnapshot(state: PhoneState, snapshot: PocketRoleplayClockSnapshot): boolean {
+  if (state.roleplayClockRealtime) return false
   let changed = false
   if (snapshot.roleplayNow && state.roleplayNow !== snapshot.roleplayNow) { state.roleplayNow = snapshot.roleplayNow; changed = true }
   if (state.roleplayClockSource !== snapshot.source) { state.roleplayClockSource = snapshot.source; changed = true }
@@ -3145,6 +3151,7 @@ function narrativeClockIso(state: PhoneState, clock: NarrativeSeedClock): string
 }
 
 function applyNarrativeClock(state: PhoneState, clock: NarrativeSeedClock): boolean {
+  if (state.roleplayClockRealtime) return false
   const explicitExact = clock.precision === 'exact' && /^\d{2}:\d{2}$/.test(clock.time)
   if (state.roleplayClockSource === 'manual' && !explicitExact) return false
   const hasEvidence = Boolean(clock.time || clock.dayPart || clock.label)
@@ -5864,6 +5871,7 @@ async function handleFrontend(payload: unknown, userId?: string): Promise<void> 
             if(state.sceneSnapshot)state.sceneSnapshot.stale=true
             state.roleplayClockPrecision=state.roleplayClockPrecision==='exact'?'exact':'relative'
             state.roleplayClockLabel=state.roleplayClockPrecision==='exact'?'Manual timeskip':label
+            if(state.roleplayClockRealtime){state.roleplayRealtimeOffsetMs=realtimeOffset((state.roleplayRealtimeOffsetMs||0)+minutes*60000);syncRealtimeClock(state)}
             if(conversation.outgoingBurst){conversation.outgoingBurst.open=false;conversation.outgoingBurst.finalized=true}
             for(const batch of state.groupBatches.filter(b=>b.conversationId===conversationId && (b.status==='queued' || b.status==='delivering')))batch.status='cancelled'
             conversation.messages.push({id:id('timeskip'),sender:'system',senderName:'Pocket',senderAccent:'',text:label,timeskip:{minutes},createdAt:roleplayNow,storyClock:roleplayClockSnapshot(state),read:true,status:'read'})
@@ -6892,9 +6900,41 @@ async function handleFrontend(payload: unknown, userId?: string): Promise<void> 
           state.roleplayClockLabel = 'Manual roleplay time'
           const timezoneOffsetMinutes = Number(payload.timezoneOffsetMinutes)
           if (Number.isFinite(timezoneOffsetMinutes)) state.roleplayTimezoneOffsetMinutes = Math.max(-840, Math.min(840, timezoneOffsetMinutes))
+          if (state.roleplayClockRealtime) {
+            // Keep flowing in real time, starting from the chosen moment.
+            const chosen = Date.parse(nextRoleplayNow)
+            if (Number.isFinite(chosen)) state.roleplayRealtimeOffsetMs = realtimeOffset(chosen - Date.now())
+            syncRealtimeClock(state)
+          }
           await saveState(state, userId)
           await sendState(state, userId, 'calendar')
           void considerAmbientMessage(context.chatId, context.characterId, 'roleplay-time', userId)
+        })
+        break
+      }
+      case 'lumiphone:set_realtime_clock': {
+        await withStateLock(stateKey(context.chatId, context.characterId), async () => {
+          const state = await loadState(context.chatId, context.characterId, userId)
+          const timezoneOffsetMinutes = Number(payload.timezoneOffsetMinutes)
+          if (Number.isFinite(timezoneOffsetMinutes)) state.roleplayTimezoneOffsetMinutes = Math.max(-840, Math.min(840, timezoneOffsetMinutes))
+          if (payload.enabled === true) {
+            state.roleplayClockRealtime = true
+            // 'real' = match the real-world time now; 'story' = keep the current story time and let it flow from there.
+            const storyMs = Date.parse(state.roleplayNow)
+            state.roleplayRealtimeOffsetMs = payload.start === 'story' && Number.isFinite(storyMs) ? realtimeOffset(storyMs - Date.now()) : 0
+            syncRealtimeClock(state)
+          } else {
+            // Freeze the clock at the current moment and return to the normal story clock.
+            syncRealtimeClock(state)
+            state.roleplayClockRealtime = undefined
+            state.roleplayRealtimeOffsetMs = undefined
+            state.roleplayClockSource = 'manual'
+            state.roleplayClockPrecision = 'exact'
+            state.roleplayClockLabel = 'Manual roleplay time'
+          }
+          state.trackers = state.trackers.map((tracker) => materializeTracker(tracker, state.roleplayNow).tracker)
+          await saveState(state, userId)
+          await sendState(state, userId, 'calendar')
         })
         break
       }
@@ -7581,8 +7621,11 @@ function ensureInterceptor(): void {
       const authorship = state.setup.authorship === 'impersonation'
         ? 'IMPERSONATION: you may author and persist newly-written messages as the Pocket Persona as well as other actors.'
         : 'ROLEPLAY: the human exclusively authors the Pocket Persona. Never send a message or initiate a call as that persona, including aliases, sender=user/persona, or group batches. Explicit phone input is supplied as history; never resend it. Persist other actors’ communication normally. Quoted dialogue in prose is not automatically a text message.'
-      const phoneRecall = roleplayPhoneRecall(projectSwipeScopedState(state))
-      const generic = { role: 'system' as const, content: `${PHONE_GUIDANCE}\n${authorship}\nCurrent Pocket snapshot:\n${projectPhoneContext(state, undefined, false)}${phoneRecall ? `\n\n${phoneRecall}` : ''}` }
+      // Real-time Pocket clock stays on the phone: the host story keeps its own timeline.
+      const omitClock = state.roleplayClockRealtime === true
+      const phoneRecall = roleplayPhoneRecall(projectSwipeScopedState(state), undefined, omitClock)
+      const clockNote = omitClock ? '\nThe Pocket phone clock runs on separate real time and is intentionally omitted. Story time is set only by the roleplay itself; do not infer it from the phone.' : ''
+      const generic = { role: 'system' as const, content: `${PHONE_GUIDANCE}\n${authorship}${clockNote}\nCurrent Pocket snapshot:\n${projectPhoneContext(state, undefined, false, omitClock)}${phoneRecall ? `\n\n${phoneRecall}` : ''}` }
       const injectedMessages = [...cleanMessages, generic]
       const breakdown = [{ messageIndex: cleanMessages.length, name: 'Pocket memory' }]
       if (normalizeTrackerContextSettings(state.trackerSettings).delivery === 'injection' && state.trackers.some(t => t.visibleToModel)) {

@@ -85,6 +85,7 @@ import { button, dateTimeLocal, el, formatDate, formatTime, inputValue, requestI
 import type { PageAction } from './shared.js'
 import { renderLauncher, type LauncherSession } from './apps/launcher.js'
 import {timeskipMinutes} from '../domain/timeskip.js'
+import {realtimeClockIso} from '../domain/realtime-clock.js'
 import {ICON_PACKS,iconPackPicker} from './components/appearance-controls.js'
 import { launcherIcon } from './components/launcher-icons.js'
 import { renderAppStore as renderAppStoreView, updateAppStore as updateAppStoreView, type AppStoreSession } from './apps/app-store.js'
@@ -1022,8 +1023,21 @@ class PocketController {
   private tickClock(): void {
     const timer = window.setInterval(() => {
       this.clock.textContent = formatTime(new Date())
-    }, 30_000)
+      this.tickRealtimeStoryClock()
+    }, 10_000)
     this.cleanups.push(() => window.clearInterval(timer))
+  }
+
+  /** Real-time Pocket clock: advance the local copy of roleplayNow and repaint clock widgets in place. */
+  private tickRealtimeStoryClock(): void {
+    const state = this.state
+    if (!state?.roleplayClockRealtime) return
+    state.roleplayNow = realtimeClockIso(state)
+    for (const card of Array.from(this.shell.querySelectorAll<HTMLElement>('.lp-launcher-clock-card[data-clock-kind="time"]'))) {
+      const date = card.querySelector('.lp-launcher-clock-date'), time = card.querySelector('.lp-launcher-clock-time')
+      if (date) date.textContent = formatDate(state.roleplayNow, false)
+      if (time) time.textContent = formatTime(state.roleplayNow)
+    }
   }
 
   private activeContext(): { chatId: string | null; characterId: string | null } {
@@ -4040,6 +4054,24 @@ class PocketController {
       const parsed = new Date(nowField.value)
       if (!Number.isNaN(parsed.getTime())) this.send('lumiphone:save_roleplay_time', { roleplayNow: parsed.toISOString(), timezoneOffsetMinutes: new Date().getTimezoneOffset() })
     })
+    const realtime = state.roleplayClockRealtime === true
+    const realtimeRow = el('div', 'lp-row-between lp-setting-row')
+    const realtimeCopy = el('span')
+    realtimeCopy.append(el('strong', '', 'Real-time clock'), el('span', 'lp-copy', realtime
+      ? 'Flows with real time. Setting a time above or using Timeskip shifts it, and it keeps flowing from there. Story replies no longer move the clock.'
+      : 'Follow the real time instead of staying where it was set.'))
+    const realtimeToggle = button('', 'lp-toggle')
+    realtimeToggle.setAttribute('aria-pressed', String(realtime))
+    realtimeToggle.setAttribute('aria-label', 'Real-time clock')
+    realtimeToggle.addEventListener('click', () => {
+      const next = realtimeToggle.getAttribute('aria-pressed') !== 'true'
+      realtimeToggle.setAttribute('aria-pressed', String(next)); realtimeToggle.disabled = true
+      this.send('lumiphone:set_realtime_clock', { enabled: next, start: 'real', timezoneOffsetMinutes: new Date().getTimezoneOffset() })
+    })
+    realtimeRow.append(realtimeCopy, realtimeToggle)
+    const continueStory = button('Flow from current story time instead', 'lp-button')
+    continueStory.addEventListener('click', () => this.send('lumiphone:set_realtime_clock', { enabled: true, start: 'story', timezoneOffsetMinutes: new Date().getTimezoneOffset() }))
+    continueStory.hidden = realtime
     const clockSource = state.roleplayClockSource === 'manual' ? 'Manual'
       : state.roleplayClockSource === 'narrative' ? 'Narrative'
         : 'Legacy / fallback'
@@ -4050,6 +4082,8 @@ class PocketController {
       nowField,
       el('p', 'lp-copy', `${clockSource}${clockPrecision}${clockLabel}`),
       setNow,
+      realtimeRow,
+      continueStory,
     )
     content.appendChild(disclosure((isFreeformChat(state.chatId) ? 'Session clock ' : 'Story clock ') + '· ' + formatTime(state.roleplayNow), nowCard))
     const overview = el('div', 'lp-timeline-overview')

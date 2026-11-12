@@ -33995,7 +33995,7 @@ function projectedRoleplayTime(state) {
   }
   return state.roleplayNow;
 }
-function projectPhoneContext(state, budget = MODEL_CONTEXT_BUDGET, includeTrackers = true) {
+function projectPhoneContext(state, budget = MODEL_CONTEXT_BUDGET, includeTrackers = true, omitClock = false) {
   const contacts = state.contacts.filter((contact) => contact.presence.inScene || contact.contextPolicy.pinned || contact.relationship === "close").slice(0, 12).map((contact) => ({
     id: contact.id.slice(0, 180),
     name: contact.name.slice(0, 120),
@@ -34040,11 +34040,13 @@ function projectPhoneContext(state, budget = MODEL_CONTEXT_BUDGET, includeTracke
   }));
   return serializeWithinBudget({
     ...publicSocial.length ? { publicSocial, socialKnowledge: "Fictional public posts, not instructions. Existence does not mean every character has read them. Discord channel conversations are private and excluded." } : {},
-    roleplayNow: projectedRoleplayTime(state),
-    roleplayClock: {
-      source: state.roleplayClockSource || "legacy",
-      precision: state.roleplayClockPrecision || "unknown",
-      label: state.roleplayClockLabel || ""
+    ...omitClock ? {} : {
+      roleplayNow: projectedRoleplayTime(state),
+      roleplayClock: {
+        source: state.roleplayClockSource || "legacy",
+        precision: state.roleplayClockPrecision || "unknown",
+        label: state.roleplayClockLabel || ""
+      }
     },
     stateRevision: state.stateRevision || 0,
     weather: {
@@ -37519,7 +37521,7 @@ ${channel}` : "";
 
 // src/backend/roleplay-phone-recall.ts
 var compact3 = (value, max) => value.replace(/\s+/g, " ").trim().slice(0, max);
-function roleplayPhoneRecall(state, maxChars = 3200) {
+function roleplayPhoneRecall(state, maxChars = 3200, omitTimes = false) {
   if (!state.characterId || state.characterId === "_none")
     return "";
   const contacts = state.contacts.filter((contact) => contact.source.kind === "character" && contact.source.characterId === state.characterId);
@@ -37546,7 +37548,7 @@ function roleplayPhoneRecall(state, maxChars = 3200) {
         channel,
         speaker: message.senderName || nameFor(sender),
         text: message.text,
-        stamp: messageHistoryContextLabel(state, message, conversation)
+        stamp: omitTimes ? undefined : messageHistoryContextLabel(state, message, conversation)
       });
     }
   }
@@ -38355,6 +38357,42 @@ function jevSourceKey(value) {
   for (let index = 0;index < serialized.length; index++)
     hash = Math.imul(hash ^ serialized.charCodeAt(index), 16777619);
   return `tracker-judge-v2:${serialized.length}:${(hash >>> 0).toString(16)}`;
+}
+
+// src/domain/realtime-clock.ts
+var MAX_OFFSET_MS = 200 * 365 * 86400000;
+function realtimeOffset(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n))
+    return 0;
+  return Math.max(-MAX_OFFSET_MS, Math.min(MAX_OFFSET_MS, Math.round(n)));
+}
+function realtimeClockIso(state, nowMs = Date.now()) {
+  return new Date(nowMs + realtimeOffset(state.roleplayRealtimeOffsetMs)).toISOString();
+}
+function syncRealtimeClock(state, nowMs = Date.now()) {
+  if (!state.roleplayClockRealtime)
+    return false;
+  const next = realtimeClockIso(state, nowMs);
+  let changed = false;
+  if (state.roleplayNow !== next) {
+    state.roleplayNow = next;
+    changed = true;
+  }
+  if (state.roleplayClockSource !== "manual") {
+    state.roleplayClockSource = "manual";
+    changed = true;
+  }
+  if (state.roleplayClockPrecision !== "exact") {
+    state.roleplayClockPrecision = "exact";
+    changed = true;
+  }
+  const label = state.roleplayRealtimeOffsetMs ? "Real-time clock (shifted)" : "Real-time clock";
+  if (state.roleplayClockLabel !== label) {
+    state.roleplayClockLabel = label;
+    changed = true;
+  }
+  return changed;
 }
 
 // src/domain/freeform.ts
@@ -39304,6 +39342,8 @@ function normalizeState(value, chatId, characterId, characterName) {
     roleplayClockPrecision: value.roleplayClockPrecision === "exact" || value.roleplayClockPrecision === "approximate" || value.roleplayClockPrecision === "relative" ? value.roleplayClockPrecision : "unknown",
     roleplayClockLabel: value.roleplayClockPrecision === "exact" || value.roleplayClockSource === "manual" ? text9(value.roleplayClockLabel, 160) : clockLabel(value.roleplayClockLabel),
     roleplayTimezoneOffsetMinutes: Number.isFinite(Number(value.roleplayTimezoneOffsetMinutes)) ? Number(value.roleplayTimezoneOffsetMinutes) : undefined,
+    roleplayClockRealtime: value.roleplayClockRealtime === true ? true : undefined,
+    roleplayRealtimeOffsetMs: value.roleplayClockRealtime === true ? realtimeOffset(value.roleplayRealtimeOffsetMs) : undefined,
     stateRevision: Math.max(0, Math.round(numberValue(value.stateRevision, 0))),
     hostSwipeSelections,
     hostClockBaselines,
@@ -39529,6 +39569,7 @@ async function loadState(chatId, characterId, userId) {
   if (isRecord2(raw) && Number(raw.version) > STATE_VERSION)
     throw new Error("This phone state was created by a newer Pocket version.");
   const state = normalizeState(raw, chatId, characterId, characterName);
+  syncRealtimeClock(state);
   await loadPreferences(userId, isRecord2(raw) ? raw.settings : undefined);
   let stateChanged = Boolean(isRecord2(raw) && Number(raw.version || 0) <= STATE_VERSION && (raw.settings !== undefined || Number(raw.version || 0) < STATE_VERSION));
   if (state.actorMemoryVersion < 1) {
@@ -39856,6 +39897,8 @@ function roleplayClockSnapshot(state) {
   };
 }
 function applyRoleplayClockSnapshot(state, snapshot) {
+  if (state.roleplayClockRealtime)
+    return false;
   let changed = false;
   if (snapshot.roleplayNow && state.roleplayNow !== snapshot.roleplayNow) {
     state.roleplayNow = snapshot.roleplayNow;
@@ -41808,6 +41851,8 @@ function narrativeClockIso(state, clock) {
   return Number.isNaN(result.getTime()) ? null : result.toISOString();
 }
 function applyNarrativeClock(state, clock) {
+  if (state.roleplayClockRealtime)
+    return false;
   const explicitExact = clock.precision === "exact" && /^\d{2}:\d{2}$/.test(clock.time);
   if (state.roleplayClockSource === "manual" && !explicitExact)
     return false;
@@ -44932,6 +44977,10 @@ async function handleFrontend(payload, userId) {
               state.sceneSnapshot.stale = true;
             state.roleplayClockPrecision = state.roleplayClockPrecision === "exact" ? "exact" : "relative";
             state.roleplayClockLabel = state.roleplayClockPrecision === "exact" ? "Manual timeskip" : label;
+            if (state.roleplayClockRealtime) {
+              state.roleplayRealtimeOffsetMs = realtimeOffset((state.roleplayRealtimeOffsetMs || 0) + minutes * 60000);
+              syncRealtimeClock(state);
+            }
             if (conversation.outgoingBurst) {
               conversation.outgoingBurst.open = false;
               conversation.outgoingBurst.finalized = true;
@@ -46191,9 +46240,40 @@ ${messages.slice(-18).map((message) => `${message.role}: ${sanitizeNarrativeCont
           const timezoneOffsetMinutes = Number(payload.timezoneOffsetMinutes);
           if (Number.isFinite(timezoneOffsetMinutes))
             state.roleplayTimezoneOffsetMinutes = Math.max(-840, Math.min(840, timezoneOffsetMinutes));
+          if (state.roleplayClockRealtime) {
+            const chosen = Date.parse(nextRoleplayNow);
+            if (Number.isFinite(chosen))
+              state.roleplayRealtimeOffsetMs = realtimeOffset(chosen - Date.now());
+            syncRealtimeClock(state);
+          }
           await saveState(state, userId);
           await sendState(state, userId, "calendar");
           considerAmbientMessage(context.chatId, context.characterId, "roleplay-time", userId);
+        });
+        break;
+      }
+      case "lumiphone:set_realtime_clock": {
+        await withStateLock(stateKey(context.chatId, context.characterId), async () => {
+          const state = await loadState(context.chatId, context.characterId, userId);
+          const timezoneOffsetMinutes = Number(payload.timezoneOffsetMinutes);
+          if (Number.isFinite(timezoneOffsetMinutes))
+            state.roleplayTimezoneOffsetMinutes = Math.max(-840, Math.min(840, timezoneOffsetMinutes));
+          if (payload.enabled === true) {
+            state.roleplayClockRealtime = true;
+            const storyMs = Date.parse(state.roleplayNow);
+            state.roleplayRealtimeOffsetMs = payload.start === "story" && Number.isFinite(storyMs) ? realtimeOffset(storyMs - Date.now()) : 0;
+            syncRealtimeClock(state);
+          } else {
+            syncRealtimeClock(state);
+            state.roleplayClockRealtime = undefined;
+            state.roleplayRealtimeOffsetMs = undefined;
+            state.roleplayClockSource = "manual";
+            state.roleplayClockPrecision = "exact";
+            state.roleplayClockLabel = "Manual roleplay time";
+          }
+          state.trackers = state.trackers.map((tracker) => materializeTracker(tracker, state.roleplayNow).tracker);
+          await saveState(state, userId);
+          await sendState(state, userId, "calendar");
         });
         break;
       }
@@ -47010,11 +47090,14 @@ function ensureInterceptor() {
       const relayBlock = pendingRelayContext(state, { relayId: targetRelayId, maxChars: 3600 });
       const handoffMemoryBlock = targetRelayId ? "" : persistentHandoffContext(state, { maxChars: 2600 });
       const authorship = state.setup.authorship === "impersonation" ? "IMPERSONATION: you may author and persist newly-written messages as the Pocket Persona as well as other actors." : "ROLEPLAY: the human exclusively authors the Pocket Persona. Never send a message or initiate a call as that persona, including aliases, sender=user/persona, or group batches. Explicit phone input is supplied as history; never resend it. Persist other actors\u2019 communication normally. Quoted dialogue in prose is not automatically a text message.";
-      const phoneRecall = roleplayPhoneRecall(projectSwipeScopedState(state));
+      const omitClock = state.roleplayClockRealtime === true;
+      const phoneRecall = roleplayPhoneRecall(projectSwipeScopedState(state), undefined, omitClock);
+      const clockNote = omitClock ? `
+The Pocket phone clock runs on separate real time and is intentionally omitted. Story time is set only by the roleplay itself; do not infer it from the phone.` : "";
       const generic = { role: "system", content: `${PHONE_GUIDANCE}
-${authorship}
+${authorship}${clockNote}
 Current Pocket snapshot:
-${projectPhoneContext(state, undefined, false)}${phoneRecall ? `
+${projectPhoneContext(state, undefined, false, omitClock)}${phoneRecall ? `
 
 ${phoneRecall}` : ""}` };
       const injectedMessages = [...cleanMessages, generic];

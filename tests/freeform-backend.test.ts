@@ -755,3 +755,57 @@ test('failed Freeform consolidation keeps its checkpoint pending for a later ret
     await host.api.userStorage.setJson(PREFERENCES_PATH, savedPrefs)
   }
 })
+
+const nearMs = (iso: string, target: number, slack = 5_000) => expect(Math.abs(Date.parse(iso) - target)).toBeLessThan(slack)
+test('real-time clock follows the wall clock, shifts with set time and timeskip, and freezes when off', async () => {
+  const { session } = await send('freeform_create', { personaId: 'persona-fern', name: 'Realtime' })
+  await send('save_roleplay_time', { ...scope(session.id), roleplayNow: '2020-01-01T09:00:00.000Z', timezoneOffsetMinutes: 0 })
+  const on = await send('set_realtime_clock', { ...scope(session.id), enabled: true, start: 'real', timezoneOffsetMinutes: -540 })
+  expect(on.error).toBeUndefined(); expect(on.state.roleplayClockRealtime).toBe(true); nearMs(on.state.roleplayNow, Date.now())
+
+  const set = await send('save_roleplay_time', { ...scope(session.id), roleplayNow: new Date(Date.now() + 86_400_000).toISOString(), timezoneOffsetMinutes: -540 })
+  nearMs(set.state.roleplayNow, Date.now() + 86_400_000)
+
+  const imported = await send('import_contact', { ...scope(session.id), kind: 'character', sourceId: 'host-character' })
+  const conversationId = imported.responses.find(p => p.type === 'lumiphone:contact_created').conversationId
+  const skipped = await send('timeskip', { ...scope(session.id), conversationId, minutes: 60 })
+  nearMs(skipped.state.roleplayNow, Date.now() + 86_400_000 + 3_600_000)
+  expect(skipped.state.roleplayClockRealtime).toBe(true)
+
+  const off = await send('set_realtime_clock', { ...scope(session.id), enabled: false })
+  expect(off.state.roleplayClockRealtime).toBeUndefined()
+  const frozen = off.state.roleplayNow
+  await Bun.sleep(1100)
+  expect((await send('freeform_open', { sessionId: session.id })).state.roleplayNow).toBe(frozen)
+
+  const story = await send('set_realtime_clock', { ...scope(session.id), enabled: true, start: 'story' })
+  nearMs(story.state.roleplayNow, Date.parse(frozen))
+  await Bun.sleep(1100)
+  const later = (await send('freeform_open', { sessionId: session.id })).state.roleplayNow
+  expect(Date.parse(later)).toBeGreaterThan(Date.parse(story.state.roleplayNow))
+})
+
+test('real-time clock stays on the phone: host story prompts omit Pocket time',async()=>{
+  const ctx={chatId:'host-chat',characterId:'host-character'}
+  await send('save_preferences',{...ctx,preferences:{suppressRoleplayTools:false}})
+  await send('save_roleplay_time',{...ctx,roleplayNow:'2031-05-05T05:05:00.000Z',timezoneOffsetMinutes:0})
+  const imported=await send('import_contact',{...ctx,kind:'character',sourceId:'host-character'})
+  const conversationId=imported.responses.find(p=>p.type==='lumiphone:contact_created')?.conversationId
+  if(conversationId)await send('action',{...ctx,action:'message',payload:{conversationId,text:'Phone hello for recall'}})
+  const prompt=async()=>JSON.stringify(await host.interceptors[0]([{role:'user',content:'RP turn'}],ctx))
+  const before=await prompt()
+  expect(before).toContain('2031-05-05T05:05')
+  const on=await send('set_realtime_clock',{...ctx,enabled:true,start:'real',timezoneOffsetMinutes:0})
+  expect(on.error).toBeUndefined()
+  const year=on.state.roleplayNow.slice(0,13)
+  const during=await prompt()
+  expect(during).toContain('intentionally omitted')
+  expect(during).not.toContain(year)
+  expect(during).not.toContain('roleplayNow')
+  expect(during).not.toContain('Story time:')
+  if(conversationId)expect(during).toContain('Phone hello for recall')
+  await send('set_realtime_clock',{...ctx,enabled:false})
+  const after=await prompt()
+  expect(after).toContain('roleplayNow')
+  expect(after).not.toContain('intentionally omitted')
+})

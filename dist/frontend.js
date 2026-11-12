@@ -41333,6 +41333,18 @@ function renderLauncher(host, extras) {
   return root;
 }
 
+// src/domain/realtime-clock.ts
+var MAX_OFFSET_MS = 200 * 365 * 86400000;
+function realtimeOffset(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n))
+    return 0;
+  return Math.max(-MAX_OFFSET_MS, Math.min(MAX_OFFSET_MS, Math.round(n)));
+}
+function realtimeClockIso(state, nowMs = Date.now()) {
+  return new Date(nowMs + realtimeOffset(state.roleplayRealtimeOffsetMs)).toISOString();
+}
+
 // src/frontend/components/launcher-icons.ts
 var paths2 = {
   bank: '<rect x="3" y="5" width="18" height="15" rx="4"/><path d="M3 10h18m-5 5h2"/>',
@@ -45852,8 +45864,22 @@ class PocketController {
   tickClock() {
     const timer = window.setInterval(() => {
       this.clock.textContent = formatTime(new Date);
-    }, 30000);
+      this.tickRealtimeStoryClock();
+    }, 1e4);
     this.cleanups.push(() => window.clearInterval(timer));
+  }
+  tickRealtimeStoryClock() {
+    const state = this.state;
+    if (!state?.roleplayClockRealtime)
+      return;
+    state.roleplayNow = realtimeClockIso(state);
+    for (const card of Array.from(this.shell.querySelectorAll('.lp-launcher-clock-card[data-clock-kind="time"]'))) {
+      const date = card.querySelector(".lp-launcher-clock-date"), time = card.querySelector(".lp-launcher-clock-time");
+      if (date)
+        date.textContent = formatDate(state.roleplayNow, false);
+      if (time)
+        time.textContent = formatTime(state.roleplayNow);
+    }
   }
   activeContext() {
     if (this.freeformSession)
@@ -50093,10 +50119,27 @@ ${body}`;
       if (!Number.isNaN(parsed.getTime()))
         this.send("lumiphone:save_roleplay_time", { roleplayNow: parsed.toISOString(), timezoneOffsetMinutes: new Date().getTimezoneOffset() });
     });
+    const realtime = state.roleplayClockRealtime === true;
+    const realtimeRow = el("div", "lp-row-between lp-setting-row");
+    const realtimeCopy = el("span");
+    realtimeCopy.append(el("strong", "", "Real-time clock"), el("span", "lp-copy", realtime ? "Flows with real time. Setting a time above or using Timeskip shifts it, and it keeps flowing from there. Story replies no longer move the clock." : "Follow the real time instead of staying where it was set."));
+    const realtimeToggle = button("", "lp-toggle");
+    realtimeToggle.setAttribute("aria-pressed", String(realtime));
+    realtimeToggle.setAttribute("aria-label", "Real-time clock");
+    realtimeToggle.addEventListener("click", () => {
+      const next = realtimeToggle.getAttribute("aria-pressed") !== "true";
+      realtimeToggle.setAttribute("aria-pressed", String(next));
+      realtimeToggle.disabled = true;
+      this.send("lumiphone:set_realtime_clock", { enabled: next, start: "real", timezoneOffsetMinutes: new Date().getTimezoneOffset() });
+    });
+    realtimeRow.append(realtimeCopy, realtimeToggle);
+    const continueStory = button("Flow from current story time instead", "lp-button");
+    continueStory.addEventListener("click", () => this.send("lumiphone:set_realtime_clock", { enabled: true, start: "story", timezoneOffsetMinutes: new Date().getTimezoneOffset() }));
+    continueStory.hidden = realtime;
     const clockSource = state.roleplayClockSource === "manual" ? "Manual" : state.roleplayClockSource === "narrative" ? "Narrative" : "Legacy / fallback";
     const clockPrecision = state.roleplayClockPrecision && state.roleplayClockPrecision !== "unknown" ? ` · ${state.roleplayClockPrecision}` : "";
     const clockLabel = state.roleplayClockLabel ? ` · ${state.roleplayClockLabel}` : "";
-    nowCard.append(el("div", "lp-eyebrow", isFreeformChat(state.chatId) ? "Session clock" : "Roleplay clock"), nowField, el("p", "lp-copy", `${clockSource}${clockPrecision}${clockLabel}`), setNow);
+    nowCard.append(el("div", "lp-eyebrow", isFreeformChat(state.chatId) ? "Session clock" : "Roleplay clock"), nowField, el("p", "lp-copy", `${clockSource}${clockPrecision}${clockLabel}`), setNow, realtimeRow, continueStory);
     content.appendChild(disclosure((isFreeformChat(state.chatId) ? "Session clock " : "Story clock ") + "· " + formatTime(state.roleplayNow), nowCard));
     const overview = el("div", "lp-timeline-overview");
     overview.append(el("strong", "", String(state.events.filter((event) => !event.completed).length)), el("span", "lp-copy", "open beats"), el("strong", "", String(state.events.filter((event) => event.completed).length)), el("span", "lp-copy", "resolved"));
